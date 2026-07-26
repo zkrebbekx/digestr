@@ -73,8 +73,18 @@ func (d *Digester[E]) advance(now time.Time) time.Time {
 func (d *Digester[E]) Add(now time.Time, e E) (immediate []E, flushed *Batch[E]) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	now = d.advance(now)
+
+	// Read the caller's Key and Dedup functions before touching any state, so
+	// that if either panics the Digester is left exactly as it was — the clock
+	// has not advanced and no window has changed. Add propagates such a panic to
+	// the caller; it does not recover it.
 	key := d.cfg.Key(e)
+	var dedupID string
+	if d.cfg.Dedup != nil {
+		dedupID = d.cfg.Dedup(e)
+	}
+
+	now = d.advance(now)
 
 	w := d.open[key]
 	if w == nil {
@@ -94,16 +104,14 @@ func (d *Digester[E]) Add(now time.Time, e E) (immediate []E, flushed *Batch[E])
 
 	// Collapse a duplicate within this window; a dropped duplicate cannot push
 	// the window over MaxSize, so the size check below sees only distinct events.
-	if d.cfg.Dedup != nil {
-		if id := d.cfg.Dedup(e); id != "" {
-			if w.seen == nil {
-				w.seen = make(map[string]struct{})
-			}
-			if _, dup := w.seen[id]; dup {
-				return nil, nil
-			}
-			w.seen[id] = struct{}{}
+	if dedupID != "" {
+		if w.seen == nil {
+			w.seen = make(map[string]struct{})
 		}
+		if _, dup := w.seen[dedupID]; dup {
+			return nil, nil
+		}
+		w.seen[dedupID] = struct{}{}
 	}
 	w.events = append(w.events, e)
 
@@ -141,7 +149,13 @@ func (d *Digester[E]) Due(now time.Time) []Batch[E] {
 	var batches []Batch[E]
 	for _, w := range d.open {
 		if !now.Before(w.dueAt) { // now >= dueAt
-			batches = append(batches, d.flush(w, Elapsed, w.dueAt))
+			// Anchor the Backoff recency marker at the poll instant, not the
+			// window's logical dueAt: the batch is surfaced for delivery now,
+			// so "a similar notification was sent recently" is measured from
+			// now. On an on-time poll now == dueAt, so this only differs when a
+			// poll runs late — where anchoring at the stale dueAt would wrongly
+			// let a quick repeat pass through instead of digesting.
+			batches = append(batches, d.flush(w, Elapsed, now))
 		}
 	}
 	// At most one window is open per key, so flushed batches have distinct keys
@@ -162,8 +176,9 @@ func (d *Digester[E]) Due(now time.Time) []Batch[E] {
 }
 
 // flush removes a window, records the send for Backoff recency, and returns the
-// batch. sendAt is the instant the batch is delivered: DueAt for an Elapsed
-// flush, now for a SizeReached one. It must be called under the lock.
+// batch. sendAt is the instant the batch is surfaced for delivery — the poll
+// now, for both an Elapsed and a SizeReached flush — which is what the Backoff
+// recency horizon is measured from. It must be called under the lock.
 func (d *Digester[E]) flush(w *openWindow[E], reason FlushReason, sendAt time.Time) Batch[E] {
 	delete(d.open, w.key)
 	if d.cfg.Strategy == Backoff {

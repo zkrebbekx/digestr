@@ -1,6 +1,7 @@
 package digestr
 
 import (
+	"fmt"
 	"sort"
 	"time"
 )
@@ -92,6 +93,14 @@ func Restore[E any](cfg Config[E], s Snapshot[E]) (*Digester[E], error) {
 	d.clock = s.Clock
 
 	for _, ws := range s.Windows {
+		// A key names at most one window; two windows sharing a key would make
+		// the map silently keep one and drop the other's events — a lost
+		// notification. A [Snapshot] never emits duplicate keys, so this can
+		// only come from a corrupt or hand-built one, and it is rejected rather
+		// than swallowed.
+		if _, dup := d.open[ws.Key]; dup {
+			return nil, fmt.Errorf("%w: snapshot has two windows for key %q", ErrBadSnapshot, ws.Key)
+		}
 		w := &openWindow[E]{
 			key:      ws.Key,
 			openedAt: ws.OpenedAt,

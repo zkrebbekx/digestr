@@ -30,4 +30,10 @@ var (
 	// ErrBadStrategy is returned when a Config names a Strategy that is neither
 	// [Fixed] nor [Backoff].
 	ErrBadStrategy = errors.New("digestr: unknown strategy")
+
+	// ErrBadSnapshot is returned by [Restore] when a Snapshot is malformed — for
+	// example, two windows sharing one key, which would silently drop events. A
+	// Snapshot produced by [Digester.Snapshot] is always well-formed; this
+	// guards against a corrupt or hand-built one.
+	ErrBadSnapshot = errors.New("digestr: malformed snapshot")
 )
