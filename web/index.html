@@ -1,0 +1,177 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>digestr — notification digest / batching playground</title>
+    <meta
+      name="description"
+      content="An in-browser, zero-backend playground for digestr: fire a flurry of notifications at recipients and watch each one's pending window fill, then flush into a single batch — by size, by dragging the clock past its deadline, or by backing off a chatty key. All computed by the pure Go batching engine compiled to WebAssembly."
+    />
+    <link rel="stylesheet" href="style.css" />
+    <!-- The Go WebAssembly runtime shim. Relative path so the site works at /digestr/. -->
+    <script src="wasm_exec.js"></script>
+    <script src="app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="topbar-inner">
+        <h1>digestr</h1>
+        <p class="tagline">notification batching — a clickable playground</p>
+        <nav class="links">
+          <a href="https://github.com/zkrebbekx/digestr" rel="noopener">Repo</a>
+          <a href="https://github.com/zkrebbekx/digestr/blob/main/docs/DESIGN.md" rel="noopener">Design</a>
+          <a href="https://pkg.go.dev/github.com/zkrebbekx/digestr" rel="noopener">API docs</a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <section class="intro">
+        <p>
+          <strong>digestr</strong> turns <em>N events per recipient</em> into
+          <em>one batch</em>. The first event for a recipient opens a
+          <em>window</em>; later events for that recipient join it. The window
+          flushes exactly once — into a single digest — on whichever trigger
+          fires first: <strong>time</strong> (the window elapsed) or
+          <strong>size</strong> (it reached a count ceiling). Under
+          <em>backoff</em>, a lone event is sent straight through and only a
+          repeat is digested. That is the whole job: it groups and windows, and
+          never sends, stores, or templates anything.
+        </p>
+        <p class="teaching-note">
+          Everything below runs in your tab over the pure library compiled to
+          WebAssembly — no backend, no network. digestr owns no timer: the page
+          supplies <code>now</code> to <code>Add</code> and <code>Due</code>, so
+          time only moves when you drag the clock. Instants are shown as seconds
+          from the session start (<code>T+0s</code>). Reload to reset. Built from
+          <a href="https://github.com/zkrebbekx/digestr" rel="noopener">zkrebbekx/digestr</a>.
+        </p>
+      </section>
+
+      <section class="scenarios" aria-label="Scenarios">
+        <span class="scenarios-label">Start with a story:</span>
+        <div id="scenario-buttons" class="scenario-buttons"></div>
+      </section>
+      <p id="scenario-note" class="scenario-note" hidden></p>
+
+      <!-- ============ CONFIG STRIP ============ -->
+      <section class="panel panel-config" id="panel-config" aria-label="Digester configuration">
+        <div class="config-row">
+          <div class="cfg">
+            <span class="cfg-label">Strategy</span>
+            <div class="seg" role="group" aria-label="Strategy">
+              <button id="strat-fixed" class="active" type="button">Fixed</button>
+              <button id="strat-backoff" type="button">Backoff</button>
+            </div>
+          </div>
+          <div class="cfg">
+            <span class="cfg-label">Window (s)</span>
+            <input id="cfg-window" type="number" min="1" step="1" value="30" />
+          </div>
+          <div class="cfg">
+            <span class="cfg-label">Size trigger <em>(0 = off)</em></span>
+            <input id="cfg-maxsize" type="number" min="0" step="1" value="0" />
+          </div>
+          <div class="cfg" id="cfg-lookback-wrap" hidden>
+            <span class="cfg-label">Look-back (s)</span>
+            <input id="cfg-lookback" type="number" min="1" step="1" value="120" />
+          </div>
+          <div class="cfg">
+            <label class="cfg-check"><input id="cfg-dedup" type="checkbox" /> Dedup by body</label>
+          </div>
+          <div class="cfg cfg-actions">
+            <button id="btn-reset" class="btn ghost small" type="button">Reset board</button>
+          </div>
+        </div>
+        <p id="config-err" class="err-banner" hidden></p>
+      </section>
+
+      <!-- ============ FLAGSHIP: the live board ============ -->
+      <section class="panel panel-board" id="panel-board" aria-label="The live batching board">
+        <h2>N events in → one batch out</h2>
+        <p class="panel-sub">
+          Fire events at a recipient and watch its window fill in the
+          <strong>in</strong> column. Flush it three ways: fire enough to hit the
+          <strong>size</strong> ceiling, drag the <b>now</b> handle past a
+          window's <strong>deadline</strong>, or let a <strong>backoff</strong>
+          key send a lone event straight through. Each flush collapses the chips
+          into one <strong>batch</strong> card on the right.
+        </p>
+
+        <!-- clock / timeline -->
+        <div class="chart-wrap">
+          <svg id="timeline-svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 200" role="img" aria-label="Per-recipient windows on a seconds timeline with a draggable now handle"></svg>
+        </div>
+        <p class="drag-hint">Drag anywhere on the timeline to move <b>now</b> — the clock only moves forward, exactly as <code>digestr</code> clamps it.</p>
+
+        <!-- fire controls -->
+        <div class="fire-bar">
+          <span class="fire-label">Fire an event at:</span>
+          <div id="fire-buttons" class="fire-buttons"></div>
+          <span class="fire-sep">·</span>
+          <input id="fire-custom" class="fire-input" type="text" placeholder="new recipient…" aria-label="new recipient name" maxlength="24" />
+          <button id="fire-custom-btn" class="btn small" type="button">+ Fire</button>
+          <span class="fire-sep">·</span>
+          <button id="btn-flush" class="btn ghost small" type="button" title="Due(now): drain windows already past their deadline">Flush due now</button>
+        </div>
+
+        <!-- counters -->
+        <div class="counters" id="counters"></div>
+
+        <!-- in -> out board -->
+        <div class="board">
+          <div class="col col-in">
+            <div class="col-head"><span class="col-title">In — pending windows</span><span class="col-hint">events accumulating per recipient</span></div>
+            <div id="in-lanes" class="lanes"></div>
+          </div>
+          <div class="col-arrow" aria-hidden="true">→</div>
+          <div class="col col-out">
+            <div class="col-head"><span class="col-title">Out — batches</span><span class="col-hint">one digest per flush</span></div>
+            <div id="out-batches" class="batches-list"></div>
+          </div>
+        </div>
+        <p id="board-err" class="err-banner" hidden></p>
+      </section>
+
+      <!-- ============ TRIGGER EXPLAINER ============ -->
+      <section class="panel" id="panel-triggers" aria-label="How a window flushes">
+        <h2>How a window flushes</h2>
+        <p class="panel-sub">
+          A window flushes exactly once, on whichever trigger comes first. Backoff
+          is a fourth idea — it decides whether an event opens a window at all.
+        </p>
+        <div class="trigger-cards">
+          <div class="tcard time">
+            <div class="tc-head"><span class="tc-dot"></span>Time — <code>Due(now)</code></div>
+            <p>A window opened at <code>T</code> is due at exactly <code>T+Window</code>. Drag the clock past the deadline and it flushes with reason <b>Elapsed</b>. The boundary is inclusive.</p>
+          </div>
+          <div class="tcard size">
+            <div class="tc-head"><span class="tc-dot"></span>Size — <code>MaxSize</code></div>
+            <p>Set a count ceiling and the <code>Add</code> that fills a window flushes it at once, reason <b>SizeReached</b> — Knock's <code>batch_size</code>, which bounds latency for a hot key.</p>
+          </div>
+          <div class="tcard backoff">
+            <div class="tc-head"><span class="tc-dot"></span>Backoff — <code>Lookback</code></div>
+            <p>A lone event with no recent send passes straight through, delivered now, opening no window. Only a repeat within the look-back opens a digest. A send starts the horizon.</p>
+          </div>
+        </div>
+        <p class="teach-foot">
+          <b>Add never time-flushes.</b> Adding an event only ever opens a window,
+          joins one, or flushes on <em>size</em>. The time trigger belongs to
+          <code>Due</code> — so a window can sit <span class="overdue-chip">overdue</span>
+          until you drag the clock or press <b>Flush due now</b>.
+        </p>
+      </section>
+
+      <footer class="footer">
+        <p>
+          Runs entirely in your tab over the pure batching engine compiled to
+          WebAssembly — no backend, no network. Reload to reset. Built from
+          <a href="https://github.com/zkrebbekx/digestr" rel="noopener">zkrebbekx/digestr</a>.
+        </p>
+      </footer>
+    </main>
+
+    <div id="boot" class="boot">Loading the digestr engine…</div>
+  </body>
+</html>
